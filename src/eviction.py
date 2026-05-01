@@ -8,10 +8,10 @@ class EvictController:
     def evict(self, scores: torch.Tensor, table: torch.Tensor, occupied: int) -> list[int]:
         tokens_removing = occupied - int(0.75 * self.max_slots)
         scores = scores[:len(table) - self.window_size]
-        scores_v, scores_i = torch.topk(scores, k=tokens_removing, largest=False)
-        remove_arr = [table[token] for token in scores_i]
+        scores_v, remove_arr_logic = torch.topk(scores, k=tokens_removing, largest=False)
+        remove_arr_phys = [table[token] for token in scores_i]
 
-        return remove_arr
+        return (remove_arr_phys, remove_arr_logic)
             
 
     

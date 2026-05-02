@@ -2,10 +2,13 @@ import torch
 
 
 class BufferManager:
-    def __init__ (self, max_slots: int, num_kv_heads: int, head_dim: int):
+    def __init__ (self, max_slots: int, num_kv_heads: int, head_dim: int,
+                  device: str = "cuda", dtype: torch.dtype = torch.float16):
         self.max_slots = max_slots
-        self.k_buffer = torch.zeros(max_slots, num_kv_heads, head_dim)
-        self.v_buffer = torch.zeros(max_slots, num_kv_heads, head_dim)
+        self.device = device
+        self.dtype = dtype
+        self.k_buffer = torch.zeros(max_slots, num_kv_heads, head_dim, device=device, dtype=dtype)
+        self.v_buffer = torch.zeros(max_slots, num_kv_heads, head_dim, device=device, dtype=dtype)
         # slots/data that is freed after being occupied
         self.free_list = []
         # next spot to write data in

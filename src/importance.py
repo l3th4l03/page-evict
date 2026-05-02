@@ -20,10 +20,9 @@ class AIA:
 
     def update(self, physical_indices: torch.Tensor, attention_weights: torch.Tensor):
         def _update():
-            # formula is New_Score = (Old_Score * gamma) + Summed_Attention_For_Current_Step
-            summed_attention = torch.sum(attention_weights, dim=1).view(-1)
+            # attention_weights is already a 1D tensor of summed scores for the active tokens
             self.scores[physical_indices] *= self.gamma
-            self.scores[physical_indices] += summed_attention
+            self.scores[physical_indices] += attention_weights
         self._run_on_stream(_update)
 
     def reset_slots(self, physical_indices: torch.Tensor):

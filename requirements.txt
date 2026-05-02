@@ -1,5 +1,5 @@
 torch>=2.6.0
-numpy>=1.24.0
 transformers>=4.45.2
+python-dotenv>=1.0.0
 # triton>=3.0.0        # needed later for Gather Attention Kernel (Phase 4)
 # datasets              # needed later for benchmarking (Phase 6)

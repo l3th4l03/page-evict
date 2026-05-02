@@ -8,7 +8,7 @@ class MappingTable:
         # index where you will write the next token
         self.write = 0
 
-    def add_index(self, buffer_loc):
+    def add_index(self, buffer_loc: int):
         self.map_tensor[self.write] = buffer_loc
         self.write += 1
 

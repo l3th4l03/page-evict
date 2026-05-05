@@ -115,8 +115,8 @@ def gather_attention(
     grid = (num_q_heads,)
 
     _gather_attention_kernel[grid](
-        Q.data_ptr(), K_buffer.data_ptr(), V_buffer.data_ptr(),
-        mapping_table.data_ptr(), output.data_ptr(),
+        Q, K_buffer, V_buffer,
+        mapping_table, output,
         # K/V strides
         K_buffer.stride(0), K_buffer.stride(1), K_buffer.stride(2),
         # Q/Output strides

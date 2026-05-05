@@ -16,6 +16,7 @@ import os
 import torch
 from dotenv import load_dotenv
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers.cache_utils import Cache, CacheLayerMixin
 
 # Load .env from project root (one level up from src/)
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".env"))
@@ -34,7 +35,7 @@ from eviction import EvictController
 # Configuration
 # ═══════════════════════════════════════════════════════════════
 
-MODEL_ID = "meta-llama/Llama-3.1-8B"
+MODEL_ID = "meta-llama/Meta-Llama-3.1-8B-Instruct"
 
 # Physical buffer holds fewer slots than max context → compression
 MAX_PHYSICAL_SLOTS = 4096
@@ -83,6 +84,66 @@ def load_model(model_id: str = MODEL_ID):
           f"head_dim={model.config.hidden_size // model.config.num_attention_heads}")
 
     return model, tokenizer
+
+
+# ═══════════════════════════════════════════════════════════════
+# HuggingFace Cache shim
+# ═══════════════════════════════════════════════════════════════
+#
+# Why this exists:
+#   HF generate uses `past_key_values.get_seq_length()` for two things on
+#   every decode step:
+#     1. Computing `position_ids` (so RoPE encodes the new token at the
+#        correct absolute position).
+#     2. Deciding whether to slice `input_ids` down to just the new token
+#        (`next_sequence_length = 1 if use_cache else None`).
+#
+#   If we set `use_cache=False`, HF re-passes the FULL growing sequence
+#   on every decode step and our Python-level prefill loop reprocesses
+#   every past token from scratch — catastrophically slow on long prompts.
+#
+#   If we set `use_cache=True` but pass no cache, HF auto-creates a
+#   DynamicCache that our patched_forward never updates, so
+#   get_seq_length() stays at 0 forever and the same bug returns.
+#
+#   So we provide a minimal Cache that owns NO K/V storage (the real
+#   cache lives in BufferManager) and only ticks a per-layer counter.
+#   patched_forward calls .update() once per call to advance it.
+
+class PageEvictLayer(CacheLayerMixin):
+    is_compileable = False
+    is_sliding = False
+
+    def __init__(self):
+        super().__init__()
+        self.seen_tokens = 0
+
+    def lazy_initialization(self, key_states: torch.Tensor, value_states: torch.Tensor) -> None:
+        self.dtype, self.device = key_states.dtype, key_states.device
+        self.is_initialized = True
+
+    def update(self, key_states: torch.Tensor, value_states: torch.Tensor, *args, **kwargs):
+        if not self.is_initialized:
+            self.lazy_initialization(key_states, value_states)
+        self.seen_tokens += key_states.shape[-2]
+        return key_states, value_states
+
+    def get_seq_length(self) -> int:
+        return self.seen_tokens
+
+    def get_max_cache_shape(self) -> int:
+        return -1
+
+    def get_mask_sizes(self, query_length: int) -> tuple[int, int]:
+        return self.seen_tokens + query_length, 0
+
+    def reset(self) -> None:
+        self.seen_tokens = 0
+
+
+class PageEvictCache(Cache):
+    def __init__(self):
+        super().__init__(layer_class_to_replicate=PageEvictLayer)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -178,12 +239,15 @@ def make_patched_forward(original_attn, state: LayerPageEvictState):
         apply_rotary_pos_emb,
         repeat_kv,
     )
+    from kernel import gather_attention
+    from kernel import gather_attention
 
     def patched_forward(
         hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
         attention_mask: torch.Tensor | None = None,
-        past_key_values=None,  # ignored — we manage our own cache
+        past_key_values=None,  # see PageEvictCache: K/V stay in BufferManager;
+                               # we only call .update() to tick the seq-length counter
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor]:
 
@@ -206,6 +270,12 @@ def make_patched_forward(original_attn, state: LayerPageEvictState):
         # Again, identical to HF's implementation.
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
+        # Advance the cache shim's per-layer seq-length counter so HF generate
+        # slices input_ids correctly on the next decode step and computes
+        # correct RoPE positions. The shim stores no K/V — we keep using buffer.
+        if past_key_values is not None:
+            past_key_values.update(key_states, value_states, state.layer_idx)
 
         # ── Step 3: Allocate New Tokens into Buffer ──
         # During prefill: seq_len = prompt length (many tokens)
@@ -236,75 +306,62 @@ def make_patched_forward(original_attn, state: LayerPageEvictState):
             # Record the virtual→physical mapping
             state.table.add_index(slot)
 
-        # ── Step 4: Gather K/V Cache from Buffer ──
-        # The mapping table tells us which physical slots contain active tokens.
-        # We gather K and V from those slots to form the full cache.
+        # ── Step 4 & 5: Compute Attention ──
         physical_indices = state.table.get_physical_indices()  # [active_tokens] (long tensor)
+        active_tokens = len(physical_indices)
 
-        k_cache = state.buffer.k_buffer[physical_indices]  # [active_tokens, num_kv_heads, head_dim]
-        v_cache = state.buffer.v_buffer[physical_indices]   # [active_tokens, num_kv_heads, head_dim]
+        if seq_len == 1:
+            # DECODE PHASE: Use the optimized Triton gather_attention kernel
+            # The kernel reads directly from the physical buffer slots, avoiding contiguous gathering
+            attn_output = gather_attention(
+                query_states,
+                state.buffer.k_buffer,
+                state.buffer.v_buffer,
+                physical_indices,
+                active_tokens
+            )
+            # We skip updating AIA during decode to maximize throughput
+            attn_weights = None
+        else:
+            # PREFILL PHASE: Use eager attention to get raw attention weights for AIA
+            k_cache = state.buffer.k_buffer[physical_indices]  # [active_tokens, num_kv_heads, head_dim]
+            v_cache = state.buffer.v_buffer[physical_indices]   # [active_tokens, num_kv_heads, head_dim]
 
-        # Reshape for attention: [batch=1, num_kv_heads, active_tokens, head_dim]
-        k_cache = k_cache.unsqueeze(0).transpose(1, 2)
-        v_cache = v_cache.unsqueeze(0).transpose(1, 2)
+            # Reshape for attention: [batch=1, num_kv_heads, active_tokens, head_dim]
+            k_cache = k_cache.unsqueeze(0).transpose(1, 2)
+            v_cache = v_cache.unsqueeze(0).transpose(1, 2)
 
-        # GQA expansion: replicate 8 KV heads → 32 Q heads
-        # LLaMA 3-8B uses Grouped Query Attention with ratio 32/8 = 4
-        k_cache = repeat_kv(k_cache, original_attn.num_key_value_groups)
-        v_cache = repeat_kv(v_cache, original_attn.num_key_value_groups)
-        # k_cache, v_cache: [1, 32, active_tokens, 128]
+            # GQA expansion: replicate 8 KV heads → 32 Q heads
+            k_cache = repeat_kv(k_cache, original_attn.num_key_value_groups)
+            v_cache = repeat_kv(v_cache, original_attn.num_key_value_groups)
+            # k_cache, v_cache: [1, 32, active_tokens, 128]
 
-        # ── Step 5: Compute Attention (Eager) ──
-        # Manual matmul attention — we need the raw attention weights for AIA.
-        #
-        # attn_weights[i, h, q, k] = how much query position q (in this step)
-        #                             attends to cached key position k.
-        #
-        # During decode (seq_len=1): query_states is [1, 32, 1, 128]
-        #   → attn_weights is [1, 32, 1, active_tokens]
-        #
-        # During prefill (seq_len=N): query_states is [1, 32, N, 128]
-        #   → attn_weights is [1, 32, N, active_tokens]
-        #   Note: causality is maintained because we inserted tokens one-at-a-time
-        #   into the buffer above, so at query position t, the buffer contains
-        #   exactly the tokens at positions 0..prompt_start+t.
-        #   BUT — all query positions here share the SAME k_cache (which includes
-        #   all tokens up to the last one). This means earlier queries see future tokens.
-        #   This is a known limitation addressed in the plan (process prefill 1-at-a-time
-        #   OR apply causal mask). For now, we apply a causal mask during prefill.
+            attn_weights = torch.matmul(
+                query_states, k_cache.transpose(2, 3)
+            ) * original_attn.scaling
+            # attn_weights: [1, num_q_heads, seq_len, active_tokens]
 
-        attn_weights = torch.matmul(
-            query_states, k_cache.transpose(2, 3)
-        ) * original_attn.scaling
-        # attn_weights: [1, num_q_heads, seq_len, active_tokens]
-
-        # Apply causal mask during prefill (seq_len > 1)
-        # Each query at position t should only attend to tokens 0..(cache_len - seq_len + t)
-        if seq_len > 1:
-            active_tokens = k_cache.shape[2]
+            # Apply causal mask during prefill
             causal_mask = torch.triu(
-                torch.full((seq_len, active_tokens), float("-inf"), device=DEVICE, dtype=DTYPE),
+                torch.full((seq_len, active_tokens), float("-inf"), device=DEVICE, dtype=query_states.dtype),
                 diagonal=active_tokens - seq_len + 1,
             )
             attn_weights = attn_weights + causal_mask.unsqueeze(0).unsqueeze(0)
 
-        attn_weights = torch.nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32)
-        attn_weights = attn_weights.to(query_states.dtype)
+            attn_weights = torch.nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32)
+            attn_weights = attn_weights.to(query_states.dtype)
 
-        attn_output = torch.matmul(attn_weights, v_cache)
-        # attn_output: [1, num_q_heads, seq_len, head_dim]
+            attn_output = torch.matmul(attn_weights, v_cache)
+            # attn_output: [1, num_q_heads, seq_len, head_dim]
 
-        # ── Step 6: Update AIA Importance Scores (Async) ──
-        # The AIA accumulates attention weights using EMA on a separate CUDA stream.
-        # We sum across query heads and query positions to get per-KV-token scores.
-        #
-        # For AIA we need attention weights indexed by PHYSICAL slot, not by
-        # the gather order. The physical_indices tensor provides that mapping.
-        #
-        # attn_weights shape: [1, num_q_heads, seq_len, active_tokens]
-        # We sum over heads(dim 1) and query positions(dim 2) → [active_tokens]
-        attn_scores_to_add = attn_weights[0].sum(dim=(0, 1))
-        state.aia.update(physical_indices, attn_scores_to_add)
+            # Update AIA Importance Scores (Async)
+            if state.aia.async_stream is not None:
+                with torch.cuda.stream(state.aia.async_stream):
+                    attn_scores_to_add = attn_weights[0].sum(dim=(0, 1))
+                    state.aia.update(physical_indices, attn_scores_to_add.detach())
+            else:
+                attn_scores_to_add = attn_weights[0].sum(dim=(0, 1))
+                state.aia.update(physical_indices, attn_scores_to_add.detach())
 
         # ── Step 7: Output Projection ──
         # Identical to HF's implementation.
@@ -321,13 +378,13 @@ def make_patched_forward(original_attn, state: LayerPageEvictState):
 # Apply Monkeypatch
 # ═══════════════════════════════════════════════════════════════
 
-def apply_page_evict(model) -> list[LayerPageEvictState]:
+def apply_page_evict(model) -> tuple[list[LayerPageEvictState], PageEvictCache]:
     """
     Replace every LlamaAttention.forward() with the page-evict version.
 
-    Returns the list of per-layer states so callers can:
-      - Inspect buffer occupancy, AIA scores, etc.
-      - Reset state between sequences
+    Returns:
+      - layer_states: per-layer buffer/table/AIA/evictor state
+      - cache: a PageEvictCache shim to pass to model.generate(past_key_values=..., use_cache=True)
     """
     config = model.config
     num_kv_heads = config.num_key_value_heads   # 8 for LLaMA 3-8B
@@ -346,24 +403,28 @@ def apply_page_evict(model) -> list[LayerPageEvictState]:
     layer_states = []
     for layer_idx in range(num_layers):
         layer = model.model.layers[layer_idx]
-        state = LayerPageEvictState(layer_idx, num_kv_heads, head_dim, DEVICE, DTYPE)
+        state = LayerPageEvictState(layer_idx, num_kv_heads, head_dim, DEVICE, model.dtype)
 
         # Replace the forward method with our patched version
         layer.self_attn.forward = make_patched_forward(layer.self_attn, state)
 
         layer_states.append(state)
 
+    cache = PageEvictCache()
+
     print(f"  Total buffer memory: "
           f"{num_layers * MAX_PHYSICAL_SLOTS * 2 * num_kv_heads * head_dim * 2 / 1024 / 1024 / 1024:.2f} GB")
     print("Monkeypatch applied.\n")
 
-    return layer_states
+    return layer_states, cache
 
 
-def reset_all_states(layer_states: list[LayerPageEvictState]):
-    """Reset all per-layer states for processing a new sequence."""
+def reset_all_states(layer_states: list[LayerPageEvictState], cache: PageEvictCache | None = None):
+    """Reset all per-layer states (and the HF cache shim) for processing a new sequence."""
     for state in layer_states:
         state.reset()
+    if cache is not None:
+        cache.reset()
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -375,7 +436,7 @@ def main():
     model, tokenizer = load_model()
 
     # ── Apply the monkeypatch ──
-    layer_states = apply_page_evict(model)
+    layer_states, cache = apply_page_evict(model)
 
     # ── Tokenize prompt ──
     prompt = "The key insight behind attention mechanisms is"
@@ -390,8 +451,9 @@ def main():
         output_ids = model.generate(
             **inputs,
             max_new_tokens=128,
-            do_sample=False,     # greedy decoding for reproducibility
-            use_cache=False,     # CRITICAL: disable HF's DynamicCache — we manage our own
+            do_sample=False,           # greedy decoding for reproducibility
+            use_cache=True,            # required: lets HF slice input_ids to 1 token on decode steps
+            past_key_values=cache,     # PageEvictCache shim — owns no K/V, just tracks seq length
         )
 
     # ── Decode and print ──
